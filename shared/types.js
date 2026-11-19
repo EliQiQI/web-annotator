@@ -15,6 +15,10 @@
  * @property {string} before
  * @property {string} selected
  * @property {string} after
+ * @property {string} [outline]
+ * @property {string} [article]
+ * @property {boolean} [articleTruncated]
+ * @property {number} [articleLength]
  */
 
 /**

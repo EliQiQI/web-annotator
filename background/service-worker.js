@@ -70,8 +70,46 @@ function normalizeContent(content) {
 }
 
 /**
+ * @param {string} url
+ * @param {RequestInit} init
+ * @param {number} timeoutMs
+ */
+async function fetchWithTimeout(url, init, timeoutMs = 90000) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...init, signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * @param {unknown} err
+ * @param {string} url
+ */
+function networkErrorMessage(err, url) {
+  const name = err && typeof err === 'object' && 'name' in err ? String(err.name) : '';
+  const msg = err && typeof err === 'object' && 'message' in err ? String(err.message) : String(err);
+
+  if (name === 'AbortError') {
+    return `请求超时（90s）\nURL: ${url}\n可稍后重试，或检查网络 / API 服务是否可用。`;
+  }
+
+  return (
+    `网络请求失败：${msg || 'Failed to fetch'}\n` +
+    `URL: ${url}\n` +
+    '请检查：\n' +
+    '1) Base URL 是否完整（通常以 /v1 结尾）\n' +
+    '2) 本机网络能否访问该域名\n' +
+    '3) 扩展已重新加载，并在弹窗中「测试连接」\n' +
+    '4) 若刚改过设置，先点「保存设置」再批注'
+  );
+}
+
+/**
  * @param {import('../shared/types.js').Settings} settings
- * @param {Array<{role: string, content: string}>} messages
+ * @param {Array<{role: string, content: any}>} messages
  * @param {{ temperature?: number, max_tokens?: number }} [opts]
  */
 async function chatCompletion(settings, messages, opts = {}) {
@@ -81,20 +119,40 @@ async function chatCompletion(settings, messages, opts = {}) {
 
   const url = resolveChatCompletionsUrl(settings.baseUrl);
   const maxTokens = opts.max_tokens ?? 1024;
+  const body = JSON.stringify({
+    model: settings.model || 'gpt-4o-mini',
+    messages,
+    temperature: opts.temperature ?? 0.3,
+    max_tokens: maxTokens,
+  });
 
-  const res = await fetch(url, {
+  const init = {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
       Authorization: `Bearer ${settings.apiKey.trim()}`,
     },
-    body: JSON.stringify({
-      model: settings.model || 'gpt-4o-mini',
-      messages,
-      temperature: opts.temperature ?? 0.3,
-      max_tokens: maxTokens,
-    }),
-  });
+    body,
+  };
+
+  let res;
+  let lastErr;
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    try {
+      res = await fetchWithTimeout(url, init, 90000);
+      lastErr = null;
+      break;
+    } catch (err) {
+      lastErr = err;
+      if (attempt < 2) {
+        await new Promise((r) => setTimeout(r, 600));
+        continue;
+      }
+    }
+  }
+  if (!res) {
+    throw new Error(networkErrorMessage(lastErr, url));
+  }
 
   const raw = await res.text();
   let data;

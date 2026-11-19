@@ -39,20 +39,31 @@
   let chatUiMessages = [];
   /** @type {Array<{id: string, kind: 'image'|'text', name: string, mime: string, dataUrl?: string, text?: string}>} */
   let pendingAttachments = [];
+  /** @type {ReturnType<typeof getSelectionContext> | null} */
+  let lastAnnotateCtx = null;
 
   function send(type, payload) {
     return new Promise((resolve, reject) => {
-      chrome.runtime.sendMessage({ type, payload }, (response) => {
-        if (chrome.runtime.lastError) {
-          reject(new Error(chrome.runtime.lastError.message));
-          return;
-        }
-        if (!response?.ok) {
-          reject(new Error(response?.error || '请求失败'));
-          return;
-        }
-        resolve(response.data);
-      });
+      try {
+        chrome.runtime.sendMessage({ type, payload }, (response) => {
+          if (chrome.runtime.lastError) {
+            const msg = chrome.runtime.lastError.message || '';
+            if (/invalidated|receiving end does not exist/i.test(msg)) {
+              reject(new Error('扩展已更新或失效，请刷新当前网页后重试。'));
+              return;
+            }
+            reject(new Error(msg));
+            return;
+          }
+          if (!response?.ok) {
+            reject(new Error(response?.error || '请求失败'));
+            return;
+          }
+          resolve(response.data);
+        });
+      } catch (err) {
+        reject(new Error(err?.message || String(err)));
+      }
     });
   }
 
@@ -296,6 +307,9 @@
       .join('');
   }
 
+  const ARTICLE_MAX_CHARS = 14000;
+  const LOCAL_WINDOW = 1800;
+
   function getSelectionContext() {
     const sel = window.getSelection();
     if (!sel || sel.rangeCount === 0 || sel.isCollapsed) return null;
@@ -306,18 +320,10 @@
     lastRange = range;
     lastSelectedText = text;
 
-    const block = nearestBlock(range.commonAncestorContainer);
-    const full = (block?.innerText || document.body.innerText || '').replace(/\s+/g, ' ').trim();
-    const idx = full.indexOf(text);
-    let before = '';
-    let after = '';
-    if (idx >= 0) {
-      before = full.slice(Math.max(0, idx - 500), idx);
-      after = full.slice(idx + text.length, idx + text.length + 500);
-    } else {
-      before = full.slice(0, 500);
-      after = '';
-    }
+    const articleRoot = findArticleRoot(range.commonAncestorContainer);
+    const articleText = normalizeArticleText(articleRoot?.innerText || document.body.innerText || '');
+    const outline = extractOutline(articleRoot || document.body);
+    const { before, after, articleForModel, truncated } = buildArticleWindows(articleText, text);
 
     return {
       title: document.title || '',
@@ -325,7 +331,134 @@
       before,
       selected: text,
       after,
+      outline,
+      article: articleForModel,
+      articleTruncated: truncated,
+      articleLength: articleText.length,
     };
+  }
+
+  function findArticleRoot(fromNode) {
+    let el = fromNode?.nodeType === Node.ELEMENT_NODE ? fromNode : fromNode?.parentElement;
+    while (el && el !== document.body) {
+      const tag = el.tagName;
+      if (tag === 'ARTICLE' || tag === 'MAIN' || el.getAttribute('role') === 'main') {
+        return el;
+      }
+      el = el.parentElement;
+    }
+
+    const candidates = [
+      document.querySelector('article'),
+      document.querySelector('main'),
+      document.querySelector('[role="main"]'),
+      document.querySelector('.post-content, .article-content, .entry-content, .markdown-body, #content, .content'),
+    ].filter(Boolean);
+
+    if (candidates.length) {
+      return candidates.sort((a, b) => (b.innerText || '').length - (a.innerText || '').length)[0];
+    }
+
+    // Fallback: largest text-heavy block under body (skip chrome-like regions)
+    let best = document.body;
+    let bestLen = 0;
+    const blocks = document.body.querySelectorAll('div, section, article, main');
+    for (const node of blocks) {
+      if (node.closest(`#${ROOT_ID}`)) continue;
+      if (node.closest('nav, header, footer, aside, [role="navigation"], [role="banner"]')) continue;
+      const len = (node.innerText || '').trim().length;
+      if (len > bestLen) {
+        bestLen = len;
+        best = node;
+      }
+    }
+    return best;
+  }
+
+  function normalizeArticleText(raw) {
+    return String(raw || '')
+      .replace(/\r/g, '')
+      .replace(/[ \t]+\n/g, '\n')
+      .replace(/\n{3,}/g, '\n\n')
+      .replace(/[ \t]{2,}/g, ' ')
+      .trim();
+  }
+
+  function extractOutline(root) {
+    if (!root) return '';
+    const headings = root.querySelectorAll('h1, h2, h3, h4');
+    const lines = [];
+    for (const h of headings) {
+      if (h.closest(`#${ROOT_ID}`)) continue;
+      const t = (h.innerText || '').replace(/\s+/g, ' ').trim();
+      if (!t) continue;
+      const level = Number(h.tagName.slice(1));
+      lines.push(`${'  '.repeat(Math.max(0, level - 1))}- ${t}`);
+      if (lines.length >= 40) break;
+    }
+    return lines.join('\n');
+  }
+
+  function buildArticleWindows(articleText, selected) {
+    const idx = articleText.indexOf(selected);
+    let before = '';
+    let after = '';
+    if (idx >= 0) {
+      before = articleText.slice(Math.max(0, idx - LOCAL_WINDOW), idx);
+      after = articleText.slice(idx + selected.length, idx + selected.length + LOCAL_WINDOW);
+    } else {
+      // Selection may differ by whitespace; fall back to local block snippet from page
+      before = articleText.slice(0, LOCAL_WINDOW);
+      after = '';
+    }
+
+    let articleForModel = articleText;
+    let truncated = false;
+
+    if (articleText.length <= ARTICLE_MAX_CHARS) {
+      if (idx >= 0) {
+        articleForModel =
+          articleText.slice(0, idx) +
+          '\n【选中开始】\n' +
+          selected +
+          '\n【选中结束】\n' +
+          articleText.slice(idx + selected.length);
+      }
+      return { before, after, articleForModel, truncated };
+    }
+
+    truncated = true;
+    // Long page: keep lead + large window around selection + tail
+    const lead = articleText.slice(0, 2500);
+    const tail = articleText.slice(-1200);
+    let around = '';
+    if (idx >= 0) {
+      const start = Math.max(0, idx - 4500);
+      const end = Math.min(articleText.length, idx + selected.length + 4500);
+      around =
+        articleText.slice(start, idx) +
+        '\n【选中开始】\n' +
+        selected +
+        '\n【选中结束】\n' +
+        articleText.slice(idx + selected.length, end);
+    } else {
+      around = `【选中文本】\n${selected}`;
+    }
+
+    articleForModel = [
+      '（全文过长，已截取关键部分；请仍按整篇文章主题理解选区）',
+      '',
+      '【文章开头】',
+      lead,
+      '',
+      '【选区附近】',
+      around,
+      '',
+      '【文章结尾】',
+      tail,
+    ].join('\n');
+
+    return { before, after, articleForModel, truncated };
   }
 
   function nearestBlock(node) {
@@ -342,29 +475,43 @@
 
   function buildInitialAnnotateMessages(ctx) {
     const system =
-      '你是网页阅读助手。根据用户选中的文字、页面上下文，以及后续对话中附带的图片/文件内容，给出简洁、准确的中文解释或批注。' +
-      '优先说明含义、背景与为何在此出现；必要时补充专有名词。支持多轮追问。使用 Markdown。';
-    const userText = [
+      '你是网页阅读助手。必须结合「整篇文章」的主题、结构和前后文来解读用户选中的片段，而不是孤立解释字面意思。' +
+      '说明该选区在全文中的作用、与前后段落/章节的关系，必要时补充专有名词。' +
+      '支持多轮追问；若用户附带图片/文件，也一并参考。使用 Markdown，条理清晰。';
+
+    const parts = [
       `页面标题：${ctx.title}`,
       `页面 URL：${ctx.url}`,
-      `上文：${ctx.before || '（无）'}`,
-      `选中文本：${ctx.selected}`,
-      `下文：${ctx.after || '（无）'}`,
+      ctx.outline ? `文章大纲：\n${ctx.outline}` : '',
+      ctx.articleTruncated
+        ? `说明：全文约 ${ctx.articleLength || '?'} 字，已截取开头/选区附近/结尾供你把握全篇。`
+        : `说明：以下提供接近完整的正文（约 ${ctx.articleLength || (ctx.article || '').length} 字）。`,
       '',
-      '请对「选中文本」做上下文批注。',
-    ].join('\n');
+      '===== 全文/正文上下文 =====',
+      ctx.article || `${ctx.before || ''}${ctx.selected}${ctx.after || ''}`,
+      '===== 正文结束 =====',
+      '',
+      `用户选中的文本：\n${ctx.selected}`,
+      '',
+      '请基于整篇文章对「选中文本」做上下文批注：先点明全文主题，再解释该选区含义及其在文中的位置与作用。',
+    ].filter(Boolean);
+
     return [
       { role: 'system', content: system },
-      { role: 'user', content: userText },
+      { role: 'user', content: parts.join('\n') },
     ];
   }
 
   async function startAnnotateChat(ctx) {
+    lastAnnotateCtx = ctx;
     chatApiMessages = buildInitialAnnotateMessages(ctx);
+    const ctxHint = ctx.articleTruncated
+      ? `已结合全文（约 ${ctx.articleLength} 字，已截取）`
+      : `已结合全文（约 ${ctx.articleLength || (ctx.article || '').length} 字）`;
     chatUiMessages = [
       {
         role: 'user',
-        text: `选中文本：${ctx.selected}`,
+        text: `选中文本：${ctx.selected}\n（${ctxHint}）`,
       },
     ];
     pendingAttachments = [];
@@ -372,7 +519,7 @@
 
     openPanel({
       title: 'AI 上下文批注',
-      meta: truncate(ctx.selected, 80),
+      meta: `${truncate(ctx.selected, 60)} · ${ctxHint}`,
       mode: 'annotate',
       selected: ctx.selected,
       loading: true,
@@ -380,7 +527,7 @@
     });
 
     try {
-      const result = await send('CHAT', { messages: chatApiMessages, max_tokens: 800 });
+      const result = await send('CHAT', { messages: chatApiMessages, max_tokens: 1200 });
       chatApiMessages.push({ role: 'assistant', content: result });
       chatUiMessages.push({ role: 'assistant', text: result });
       if (panelState) panelState.result = result;
@@ -692,19 +839,25 @@
       return;
     }
     if (action === 'clear' && panelState?.mode === 'annotate') {
-      const selected = panelState.selected;
       chatApiMessages = [];
       chatUiMessages = [];
       pendingAttachments = [];
       renderAttachList();
-      if (selected) {
-        await startAnnotateChat({
-          title: document.title || '',
-          url: location.href,
-          before: '',
-          selected,
-          after: '',
-        });
+      const ctx =
+        lastAnnotateCtx ||
+        (panelState.selected
+          ? {
+              title: document.title || '',
+              url: location.href,
+              before: '',
+              selected: panelState.selected,
+              after: '',
+              article: '',
+              outline: '',
+            }
+          : null);
+      if (ctx?.selected) {
+        await startAnnotateChat(ctx);
       } else {
         refreshChatView(false);
       }
