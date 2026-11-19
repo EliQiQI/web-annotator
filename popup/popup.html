@@ -1,0 +1,78 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Web Annotator 设置</title>
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body>
+    <main>
+      <header>
+        <h1>Web Annotator</h1>
+        <p>AI 上下文批注 · 网页翻译</p>
+      </header>
+
+      <form id="settings-form">
+        <label>
+          API Base URL
+          <input
+            id="baseUrl"
+            name="baseUrl"
+            type="url"
+            placeholder="https://api.openai.com/v1"
+            required
+          />
+          <span class="hint">填到 /v1 为止，例如 …/compatible-mode/v1；不要漏路径</span>
+        </label>
+
+        <label>
+          API Key
+          <input
+            id="apiKey"
+            name="apiKey"
+            type="password"
+            placeholder="sk-..."
+            autocomplete="off"
+          />
+        </label>
+
+        <label>
+          模型
+          <input id="model" name="model" type="text" placeholder="gpt-4o-mini" required />
+        </label>
+
+        <label>
+          翻译目标语言
+          <select id="targetLang" name="targetLang">
+            <option value="zh">中文</option>
+            <option value="en">English</option>
+            <option value="ja">日本語</option>
+            <option value="ko">한국어</option>
+            <option value="fr">Français</option>
+            <option value="de">Deutsch</option>
+            <option value="es">Español</option>
+          </select>
+        </label>
+
+        <div class="actions">
+          <button type="submit" id="save-btn">保存设置</button>
+          <button type="button" id="test-btn" class="secondary">测试连接</button>
+        </div>
+      </form>
+
+      <div class="page-actions">
+        <button type="button" id="translate-page-btn" class="secondary">翻译当前页</button>
+        <button type="button" id="restore-page-btn" class="ghost">还原当前页</button>
+      </div>
+
+      <p id="status" class="status" role="status"></p>
+
+      <footer>
+        <p>API Key 仅保存在本机 <code>chrome.storage.sync</code>，只会发往你配置的 Base URL。</p>
+        <p>划词后使用工具条进行 AI 批注或翻译选区。</p>
+      </footer>
+    </main>
+    <script type="module" src="popup.js"></script>
+  </body>
+</html>
